@@ -232,10 +232,16 @@ with tab3:
                 4. Geef een duidelijke conclusie: is dit een koop, houd, of verkoop kandidaat op basis van deze mix van data en nieuws?
                 """
             
-            with st.spinner("Agent schrijft het rapport..."):
+            with st.spinner("Agent schrijft het rapport (model zoeken)..."):
                 try:
-                    # 5. Roep het Gemini model aan
-                    model = genai.GenerativeModel('gemini-pro') # Snel en krachtig model
+                    # 5. Vraag Google welke modellen we mogen gebruiken
+                    beschikbare_modellen = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+                    
+                    # Zoek automatisch naar een 'flash' of 'pro' model, of pak gewoon de eerste die werkt
+                    gekozen_model = next((m for m in beschikbare_modellen if 'flash' in m), 
+                                    next((m for m in beschikbare_modellen if 'pro' in m), beschikbare_modellen[0]))
+                    
+                    model = genai.GenerativeModel(gekozen_model)
                     response = model.generate_content(agent_prompt)
                     
                     # 6. Toon het resultaat prachtig in Streamlit

@@ -7,6 +7,7 @@ import concurrent.futures
 from datetime import datetime, timedelta
 import requests
 import io
+import google.generativeai as genai
 
 # --- 1. CONFIGURATIE & CACHING ---
 st.set_page_config(page_title="S&P 600 Quality Screener", layout="wide", page_icon="📈")
@@ -177,14 +178,72 @@ with tab2:
             st.dataframe(df_display[['Ticker', 'Alpha Score', 'Quadrant', 'PE_Clean']], hide_index=True, use_container_width=True)
 
 with tab3:
-    st.header("🤖 Genereer AI Analyse Prompt")
-    st.write("Gebruik deze tool om direct een op maat gemaakte prompt te genereren voor je favoriete AI.")
-    if not st.session_state.df_top.empty:
-        selected_ticker = st.selectbox("Selecteer een aandeel:", st.session_state.df_top['Ticker'].tolist())
-        stock_data = st.session_state.df_top[st.session_state.df_top['Ticker'] == selected_ticker].iloc[0]
-        prompt_text = f"""Analyseer aandeel {selected_ticker}. 
-Het heeft een ROE van {stock_data['ROE']:.2f}, een Beta van {stock_data['Beta']:.2f}, een P/E ratio van {stock_data['PE_Clean']:.2f} en staat momenteel in het '{stock_data['Quadrant']}' kwadrant van de RRG. 
-Gebruik de "Quality minus Junk" theorie van Asness om de fundamentele gezondheid in kaart te brengen."""
-        st.text_area("Plak dit in Gemini/ChatGPT:", value=prompt_text, height=150)
+    st.header("🤖 Live AI Agent Analyse")
+    st.write("Laat de AI direct een diepgaande analyse schrijven op basis van de screener-data én het meest recente nieuws.")
+    
+    # 1. Check of de API key is ingesteld (bijv. in Streamlit Secrets)
+    api_key = st.secrets.get("GEMINI_API_KEY", None)
+    
+    if not api_key:
+        st.warning("⚠️ Voeg je GEMINI_API_KEY toe aan je Streamlit Secrets om de Live Agent te gebruiken.")
+    elif not st.session_state.df_top.empty:
+        # Configureer de Gemini API
+        genai.configure(api_key=api_key)
+        
+        selected_ticker = st.selectbox("Selecteer een aandeel voor de AI Agent:", st.session_state.df_top['Ticker'].tolist())
+        
+        if st.button(f"Genereer Rapport voor {selected_ticker}", type="primary"):
+            with st.spinner(f"Agent is actueel nieuws aan het ophalen voor {selected_ticker}..."):
+                
+                # 2. Haal actueel nieuws op via yfinance
+                ticker_obj = yf.Ticker(selected_ticker)
+                news_items = ticker_obj.news
+                
+                news_context = ""
+                if news_items:
+                    news_context = "Recente Nieuwskoppen:\n"
+                    for item in news_items[:5]: # Pak de 5 meest recente artikelen
+                        title = item.get('title', 'Geen titel')
+                        publisher = item.get('publisher', 'Onbekend')
+                        news_context += f"- {title} (Bron: {publisher})\n"
+                else:
+                    news_context = "Geen recent nieuws gevonden via Yahoo Finance."
+
+                # 3. Verzamel de kwantitatieve data
+                stock_data = st.session_state.df_top[st.session_state.df_top['Ticker'] == selected_ticker].iloc[0]
+                
+                # 4. Bouw de krachtige, dynamische prompt voor de AI
+                agent_prompt = f"""
+                Je bent een expert kwantitatief analist en portfolio manager. Analyseer aandeel {selected_ticker}. 
+
+                Hier zijn de fundamentele feiten uit onze QARP-screener:
+                - ROE (Return on Equity): {stock_data['ROE']:.2f}
+                - Beta (Volatiliteit/Risico): {stock_data['Beta']:.2f}
+                - P/E ratio: {stock_data['PE_Clean']:.2f}
+                - RRG Trend: Het aandeel bevindt zich in het '{stock_data['Quadrant']}' kwadrant.
+
+                Hier is de actuele nieuwscontext (gebruik dit om de katalysatoren en risico's te duiden):
+                {news_context}
+
+                Schrijf een kort, krachtig en professioneel beleggingsrapport. 
+                1. Beoordeel de fundamentele gezondheid via de "Quality minus Junk" theorie van Asness.
+                2. Beoordeel de waardering volgens Benjamin Graham.
+                3. Integreer de nieuwskoppen om uit te leggen *waarom* het aandeel momenteel in het {stock_data['Quadrant']} kwadrant staat.
+                4. Geef een duidelijke conclusie: is dit een koop, houd, of verkoop kandidaat op basis van deze mix van data en nieuws?
+                """
+            
+            with st.spinner("Agent schrijft het rapport..."):
+                try:
+                    # 5. Roep het Gemini model aan
+                    model = genai.GenerativeModel('gemini-1.5-flash') # Snel en krachtig model
+                    response = model.generate_content(agent_prompt)
+                    
+                    # 6. Toon het resultaat prachtig in Streamlit
+                    st.success("Analyse voltooid!")
+                    st.markdown(f"### 📊 AI Agent Rapport: {selected_ticker}")
+                    st.markdown(response.text)
+                    
+                except Exception as e:
+                    st.error(f"Er ging iets mis met de AI: {e}")
     else:
-        st.info("Draai eerst de screener.")
+        st.info("Draai eerst de screener in de 'Screener & Resultaten' tab om aandelen te kunnen selecteren.")

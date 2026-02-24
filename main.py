@@ -3,210 +3,194 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import math
+import concurrent.futures
 from datetime import datetime, timedelta
 
 # --- 1. CONFIGURATIE & CACHING ---
-st.set_page_config(page_title="Scientific Small-Cap Screener", layout="wide")
+st.set_page_config(page_title="Scientific Small-Cap Screener", layout="wide", page_icon="🔬")
 
-@st.cache_data(ttl=3600)
-def get_benchmark_data(ticker="IWM", periods=200):
-    """Haalt benchmark data op voor RRG berekening."""
+@st.cache_data(ttl=86400) # Cache voor 24 uur
+def get_sp600_tickers():
+    """Haalt de actuele S&P 600 lijst van Wikipedia."""
+    url = 'https://en.wikipedia.org/wiki/List_of_S%26P_600_companies'
+    tables = pd.read_html(url)
+    df = tables[0]
+    # Vervang punten door streepjes voor Yahoo Finance (bijv. BRK.B -> BRK-B)
+    tickers = df['Symbol'].astype(str).str.replace('.', '-', regex=False).tolist()
+    return tickers
+
+@st.cache_data(ttl=3600) # Cache prijzen voor 1 uur
+def get_bulk_prices(tickers, benchmark="IWM", periods=200):
+    """Downloadt prijzen voor de hele index én benchmark in één keer gevectoriseerd."""
+    all_tickers = tickers + [benchmark]
     end = datetime.today()
     start = end - timedelta(days=periods)
-    data = yf.download(ticker, start=start, end=end, progress=False)['Adj Close']
-    return data
-
-def get_test_tickers():
-    """Geeft een testset van S&P 600 tickers om yfinance time-outs te voorkomen."""
-    # In productie: vervang dit door pd.read_html() van een S&P 600 Wikipedia pagina
-    return ['AAON', 'AAT', 'ABCB', 'ABM', 'ADTN', 'AEIS', 'AGYS', 'ALRM', 'AMWD', 'ATNI']
-
-# --- 2. WETENSCHAPPELIJKE FUNCTIES ---
-
-def calculate_quality_metrics(ticker_symbol):
-    """Berekent de Quality Score (Profitability, Safety)."""
-    try:
-        ticker = yf.Ticker(ticker_symbol)
-        info = ticker.info
-        
-        # Ophalen fundamenten (met default fallback naar NaN of penalty waarden)
-        market_cap = info.get('marketCap', np.nan)
-        roe = info.get('returnOnEquity', 0)
-        beta = info.get('beta', 1.5) # Default hoge beta = safety penalty
-        
-        # Gross Profitability = Gross Profit / Total Assets (Vaak lastig via yf.info, we benaderen via ROE & Marges)
-        gross_margins = info.get('grossMargins', 0)
-        
-        # Quality Score Logica (versimpeld voor yfinance data)
-        # Hoge ROE is goed, Hoge Marges is goed, Lage Beta is goed (Safety)
-        profitability_score = (roe * 100) + (gross_margins * 100)
-        safety_score = max(0, (2.0 - beta) * 50) # Betting Against Beta: Beta < 1 krijgt hogere score
-        
-        quality_score = profitability_score + safety_score
-        
-        return {
-            'Ticker': ticker_symbol,
-            'Market Cap': market_cap,
-            'ROE': roe,
-            'Beta': beta,
-            'Quality Score': quality_score
-        }
-    except Exception as e:
-        return None
-
-def calculate_rrg_scores(df_prices, benchmark_prices, window=14):
-    """Berekent JdK RS-Ratio, RS-Momentum, Heading en Distance."""
-    # Relatieve prijs t.o.v. benchmark
-    rel_price = df_prices / benchmark_prices
     
-    # RS-Ratio (Gesmoothe relatieve sterkte)
-    rs_ratio = 100 + ((rel_price / rel_price.rolling(window).mean()) - 1) * 100
+    # Bulk download is enorm veel sneller dan loopen
+    df_prices = yf.download(all_tickers, start=start, end=end, progress=False)
     
-    # RS-Momentum (Rate of change van RS-Ratio)
+    # Fix voor de KeyError: Omgaan met nieuwe yfinance MultiIndex structuur
+    if isinstance(df_prices.columns, pd.MultiIndex):
+        if 'Close' in df_prices.columns.levels[0]:
+            df_close = df_prices['Close']
+        elif 'Adj Close' in df_prices.columns.levels[0]:
+            df_close = df_prices['Adj Close']
+        else:
+            st.error("Kon geen 'Close' of 'Adj Close' prijzen vinden in de yfinance data.")
+            return None, None
+    else:
+        df_close = df_prices
+
+    # Splits benchmark en aandelen
+    if benchmark in df_close.columns:
+        benchmark_prices = df_close[benchmark]
+        stock_prices = df_close.drop(columns=[benchmark])
+    else:
+        return None, None
+        
+    return stock_prices, benchmark_prices
+
+@st.cache_data(ttl=86400)
+def get_fundamentals_bulk(tickers):
+    """Haalt fundamentele data op via asynchrone multithreading."""
+    def fetch_info(ticker):
+        try:
+            info = yf.Ticker(ticker).info
+            # Filter 'Junk' via default waarden (slechte ROE, hoge Beta als data ontbreekt)
+            return {
+                'Ticker': ticker,
+                'Market Cap': info.get('marketCap', np.nan),
+                'ROE': info.get('returnOnEquity', 0) if info.get('returnOnEquity') is not None else 0,
+                'Beta': info.get('beta', 1.5) if info.get('beta') is not None else 1.5,
+                'Gross Margins': info.get('grossMargins', 0) if info.get('grossMargins') is not None else 0
+            }
+        except:
+            return None
+
+    results = []
+    # Beperk workers tot 10 om Yahoo Finance rate-limits te voorkomen
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for res in executor.map(fetch_info, tickers):
+            if res is not None:
+                results.append(res)
+                
+    return pd.DataFrame(results)
+
+# --- 2. GEVECTORISEERDE WETENSCHAPPELIJKE BEREKENINGEN ---
+
+def calculate_rrg_vectorized(stock_prices, benchmark_prices, window=14):
+    """Berekent RRG metrics voor ALLE aandelen tegelijk m.b.v. Pandas en Numpy."""
+    # Lijn de dataframes uit op index (datums)
+    stock_prices, benchmark_prices = stock_prices.align(benchmark_prices, join='inner', axis=0)
+    
+    # Relatieve prijs t.o.v. benchmark (Matrix deling)
+    rel_prices = stock_prices.div(benchmark_prices, axis=0)
+    
+    # RS-Ratio
+    rs_ratio = 100 + ((rel_prices / rel_prices.rolling(window).mean()) - 1) * 100
+    
+    # RS-Momentum
     rs_momentum = 100 + ((rs_ratio / rs_ratio.rolling(window).mean()) - 1) * 100
     
-    # We pakken de meest recente waarden
+    # We pakken alleen de laatste actuele dag
     current_ratio = rs_ratio.iloc[-1]
     current_mom = rs_momentum.iloc[-1]
     
-    # Bepaal Distance & Heading
-    # Distance = wortel van de kwadratensom (afstand tot middelpunt 100,100)
-    distance = math.sqrt((current_ratio - 100)**2 + (current_mom - 100)**2)
+    # Combineer in één dataframe
+    df_rrg = pd.DataFrame({
+        'RS-Ratio': current_ratio,
+        'RS-Momentum': current_mom
+    }).dropna()
     
-    # Heading (Hoek in graden, 0 tot 360)
-    angle_rad = math.atan2(current_mom - 100, current_ratio - 100)
-    heading = math.degrees(angle_rad)
-    if heading < 0:
-        heading += 360
-        
-    # Sweet Spot multiplier (45 graden is perfect noordoost = maximale score)
-    # We belonen headings in het Noordoostelijke kwadrant (0-90 graden)
-    sweet_spot_multiplier = math.cos(math.radians(heading - 45)) if 0 <= heading <= 90 else 0.1
+    # Vectorized Distance & Heading berekening met Numpy
+    df_rrg['Distance'] = np.sqrt((df_rrg['RS-Ratio'] - 100)**2 + (df_rrg['RS-Momentum'] - 100)**2)
     
-    return current_ratio, current_mom, distance, heading, sweet_spot_multiplier
-
-def filter_small_cap_quality(df_results, max_market_cap=3e9):
-    """Filtert op marktkapitalisatie (Size) en sorteert op Quality."""
-    # Filter 'Junk' eruit en houd alleen 'Small' over
-    filtered = df_results[(df_results['Market Cap'] <= max_market_cap) & 
-                          (df_results['Quality Score'] > df_results['Quality Score'].median())]
-    return filtered.sort_values(by='Alpha Score', ascending=False)
-
+    angle_rad = np.arctan2(df_rrg['RS-Momentum'] - 100, df_rrg['RS-Ratio'] - 100)
+    heading = np.degrees(angle_rad)
+    df_rrg['Heading'] = np.where(heading < 0, heading + 360, heading)
+    
+    # Sweet Spot multiplier (0-90 graden belonen met cosinus van hoek t.o.v. 45 graden)
+    df_rrg['Sweet_Spot_Multiplier'] = np.where(
+        (df_rrg['Heading'] >= 0) & (df_rrg['Heading'] <= 90),
+        np.cos(np.radians(df_rrg['Heading'] - 45)),
+        0.1
+    )
+    
+    df_rrg.reset_index(inplace=True)
+    df_rrg.rename(columns={'index': 'Ticker', 'Ticker': 'Ticker'}, inplace=True)
+    return df_rrg
 
 # --- 3. STREAMLIT UI ---
 
-st.title("🔬 Scientific Small-Cap Quality Screener")
-st.markdown("*Gebaseerd op 'Size Matters, if You Control Your Junk' (Asness et al., 2018)*")
+st.title("🔬 Scientific S&P 600 Quality Screener")
+st.markdown("*Volledig gevectoriseerde engine gebaseerd op 'Size Matters, if You Control Your Junk' (Asness et al., 2018)*")
 
-tab1, tab2, tab3 = st.tabs(["Methodologie", "Screener", "AI Analyst Prompt"])
-
-with tab1:
-    st.header("Wetenschappelijke Context")
-    st.write("""
-    Het 'Size Premium' (Banz, 1981) stelt dat kleine bedrijven grote bedrijven verslaan. Echter, dit effect lijkt vaak te verdwijnen in moderne markten. 
-    Asness et al. (2018) toonden aan dat dit komt door de invloed van 'Junk' aandelen (lage winstgevendheid, hoge schulden, hoge volatiliteit).
-    
-    **Dit systeem gebruikt drie pijlers:**
-    1. **Size:** Filtert onder de grens van small-caps (bijv. < $3 Miljard).
-    2. **Quality (QMJ):** Berekent een score op basis van Return on Equity en Betting Against Beta (lage volatiliteit).
-    3. **Momentum (RRG):** Gebruikt Relative Rotation Graphs om de fase van de cyclus te bepalen.
-    """)
-    st.latex(r"Alpha \ Score = Distance \times \cos(Heading - 45^\circ) \times Quality \ Score")
+tab1, tab2 = st.tabs(["Dashboard & RRG", "Methodologie & Alpha Score"])
 
 with tab2:
-    st.header("Live Screener")
-    st.warning("Let op: Deze demo gebruikt een kleine subset van de S&P 600 om time-outs bij Yahoo Finance te voorkomen. Voor de volledige S&P 600 is een lokale database vereist.")
-    
-    if st.button("Start Screening"):
-        tickers = get_test_tickers()
-        benchmark_prices = get_benchmark_data("IWM") # Russell 2000 ETF als benchmark
-        
-        results = []
-        progress_bar = st.progress(0)
-        
-        for i, ticker in enumerate(tickers):
-            # 1. Quality Metrics
-            q_metrics = calculate_quality_metrics(ticker)
-            
-            # 2. Prijs Data & RRG
-            end = datetime.today()
-            start = end - timedelta(days=200)
-            prices = yf.download(ticker, start=start, end=end, progress=False)['Adj Close']
-            
-            if q_metrics and not prices.empty and len(prices) == len(benchmark_prices):
-                ratio, mom, distance, heading, ss_mult = calculate_rrg_scores(prices, benchmark_prices)
-                
-                # Bereken Alpha Score
-                alpha_score = distance * ss_mult * q_metrics['Quality Score']
-                
-                results.append({
-                    'Ticker': ticker,
-                    'Market Cap': q_metrics['Market Cap'],
-                    'Quality Score': q_metrics['Quality Score'],
-                    'RS-Ratio': ratio,
-                    'RS-Momentum': mom,
-                    'Distance': distance,
-                    'Heading': heading,
-                    'Alpha Score': alpha_score
-                })
-            
-            progress_bar.progress((i + 1) / len(tickers))
-            
-        df_results = pd.DataFrame(results)
-        
-        if not df_results.empty:
-            st.subheader("RRG Scatter Plot (Relative Rotation Graph)")
-            # RRG Plotly Visualisatie
-            fig = px.scatter(
-                df_results, 
-                x="RS-Ratio", 
-                y="RS-Momentum", 
-                text="Ticker",
-                size="Quality Score",
-                color="Alpha Score",
-                color_continuous_scale="Viridis",
-                title="RRG t.o.v. IWM Benchmark",
-                labels={"RS-Ratio": "Relatieve Sterkte (RS-Ratio)", "RS-Momentum": "Relatief Momentum (RS-Momentum)"}
-            )
-            # Voeg kwadrantlijnen toe
-            fig.add_hline(y=100, line_dash="dash", line_color="gray")
-            fig.add_vline(x=100, line_dash="dash", line_color="gray")
-            # Annotaties voor kwadranten
-            fig.add_annotation(x=105, y=105, text="Leading (Noordoost)", showarrow=False)
-            fig.add_annotation(x=95, y=105, text="Improving (Noordwest)", showarrow=False)
-            fig.add_annotation(x=95, y=95, text="Lagging (Zuidwest)", showarrow=False)
-            fig.add_annotation(x=105, y=95, text="Weakening (Zuidoost)", showarrow=False)
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            st.subheader("🏆 Alpha Picks (High Quality Small-Caps)")
-            df_alpha = filter_small_cap_quality(df_results)
-            
-            # Formatteer voor weergave
-            df_display = df_alpha.copy()
-            df_display['Market Cap'] = df_display['Market Cap'].apply(lambda x: f"${x/1e9:.2f}B")
-            df_display['Quality Score'] = df_display['Quality Score'].round(2)
-            df_display['Alpha Score'] = df_display['Alpha Score'].round(2)
-            df_display['Heading'] = df_display['Heading'].round(1)
-            
-            st.dataframe(df_display[['Ticker', 'Market Cap', 'Quality Score', 'Heading', 'Alpha Score']], hide_index=True)
+    st.header("Wetenschappelijke Context")
+    st.write("""
+    Het 'Size Premium' stelt dat kleine bedrijven grote bedrijven verslaan. Asness (2018) toonde aan dat dit effect sterker is als je 'Junk' filtert.
+    In dit systeem wordt Quality berekend als: `(ROE + Marges) + (Lage Beta Bonus)`.
+    Alpha Score combineert dit met de RRG positie (Distance x Heading).
+    """)
 
-with tab3:
-    st.header("🤖 AI Analyst Prompt")
-    st.write("Kopieer de resultaten uit de tabel hierboven en voeg ze samen met deze prompt om een AI de data te laten interpreteren.")
-    
-    prompt_text = """
-    Je bent een Senior Quantitative Analyst. Analyseer de volgende data van mijn 'Scientific Small-Cap Quality Screener' (gebaseerd op Asness et al., 2018). 
-    
-    De 'Alpha Score' is berekend op basis van Quality (ROE, Marges, Beta) vermenigvuldigd met de Distance en de 'Sweet Spot' Heading (0-90 graden) in de RRG.
-    
-    Hier is de data van de top aandelen:
-    [PLAK HIER JE DATAFRAME]
-    
-    Beantwoord de volgende vragen:
-    1. Welke 2 aandelen vertonen de krachtigste combinatie van Quality en Momentum ('Leading' kwadrant)?
-    2. Zijn er potentiële 'Value Traps' in de lijst (aandelen met een hoge Quality, maar een negatief RS-Momentum richting 'Lagging')?
-    3. Geef een kort, actiegericht oordeel over de spreiding van sectoren binnen deze resultaten.
-    """
-    st.code(prompt_text, language="text")
+with tab1:
+    if st.button("Start Volledige S&P 600 Scan (Ca. 15-30 seconden)"):
+        with st.spinner('S&P 600 Tickers ophalen...'):
+            tickers = get_sp600_tickers()
+            
+        with st.spinner('Gevectoriseerde prijsdata downloaden (RRG)...'):
+            stock_prices, benchmark_prices = get_bulk_prices(tickers)
+            
+        if stock_prices is not None:
+            with st.spinner('Fundamenten ophalen via asynchrone threads (Quality Score)...'):
+                df_fundamentals = get_fundamentals_bulk(tickers)
+                
+            with st.spinner('Alpha Scores genereren...'):
+                # 1. RRG Berekenen
+                df_rrg = calculate_rrg_vectorized(stock_prices, benchmark_prices)
+                
+                # 2. Quality Score Berekenen in Fundamentals
+                df_fundamentals['Profitability'] = (df_fundamentals['ROE'] * 100) + (df_fundamentals['Gross Margins'] * 100)
+                df_fundamentals['Safety'] = np.maximum(0, (2.0 - df_fundamentals['Beta']) * 50) # Betting Against Beta
+                df_fundamentals['Quality Score'] = df_fundamentals['Profitability'] + df_fundamentals['Safety']
+                
+                # 3. Mergen en Alpha Score berekenen
+                df_final = pd.merge(df_rrg, df_fundamentals, on='Ticker', how='inner')
+                df_final['Alpha Score'] = df_final['Distance'] * df_final['Sweet_Spot_Multiplier'] * df_final['Quality Score']
+                
+                # Sorteer en filter op de beste aandelen
+                df_top = df_final[df_final['Quality Score'] > 0].sort_values(by='Alpha Score', ascending=False).head(50)
+            
+            st.success("Screener succesvol voltooid op de gehele S&P 600!")
+            
+            # --- VISUALISATIES ---
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.subheader("RRG Scatter Plot (Top 50 Alpha's)")
+                fig = px.scatter(
+                    df_top, 
+                    x="RS-Ratio", 
+                    y="RS-Momentum", 
+                    text="Ticker",
+                    size="Quality Score",
+                    color="Alpha Score",
+                    color_continuous_scale="Viridis",
+                    title="Relative Rotation Graph t.o.v. IWM",
+                    hover_data=['ROE', 'Beta', 'Heading']
+                )
+                fig.add_hline(y=100, line_dash="dash", line_color="gray")
+                fig.add_vline(x=100, line_dash="dash", line_color="gray")
+                fig.add_annotation(x=105, y=105, text="Leading (Noordoost)", showarrow=False)
+                fig.add_annotation(x=95, y=95, text="Lagging (Zuidwest)", showarrow=False)
+                st.plotly_chart(fig, use_container_width=True)
+                
+            with col2:
+                st.subheader("🏆 Top 15 Alpha Picks")
+                df_display = df_top.head(15)[['Ticker', 'Alpha Score', 'Quality Score', 'Heading']]
+                df_display['Alpha Score'] = df_display['Alpha Score'].round(0)
+                df_display['Quality Score'] = df_display['Quality Score'].round(1)
+                df_display['Heading'] = df_display['Heading'].round(1).astype(str) + "°"
+                st.dataframe(df_display, hide_index=True)

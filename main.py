@@ -5,16 +5,30 @@ import numpy as np
 import plotly.express as px
 import concurrent.futures
 from datetime import datetime, timedelta
+import requests  # <-- NIEUW
+import io        # <-- NIEUW
 
 # --- 1. CONFIGURATIE & CACHING ---
 st.set_page_config(page_title="Scientific Small-Cap Screener", layout="wide", page_icon="🔬")
 
 @st.cache_data(ttl=86400) # Cache voor 24 uur
 def get_sp600_tickers():
-    """Haalt de actuele S&P 600 lijst van Wikipedia."""
+    """Haalt de actuele S&P 600 lijst van Wikipedia met een User-Agent bypass."""
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_600_companies'
-    tables = pd.read_html(url)
+    
+    # Voeg een User-Agent header toe zodat Wikipedia ons niet blokkeert
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    # Haal de pagina op via requests in plaats van direct via pandas
+    response = requests.get(url, headers=headers)
+    response.raise_for_status() # Check of het ophalen gelukt is
+    
+    # Lees de HTML via io.StringIO (voorkomt Pandas deprecation warnings)
+    tables = pd.read_html(io.StringIO(response.text))
     df = tables[0]
+    
     # Vervang punten door streepjes voor Yahoo Finance (bijv. BRK.B -> BRK-B)
     tickers = df['Symbol'].astype(str).str.replace('.', '-', regex=False).tolist()
     return tickers

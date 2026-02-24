@@ -50,7 +50,7 @@ def get_fundamentals_bulk(tickers):
                 'ROE': info.get('returnOnEquity', 0) or 0,
                 'Beta': info.get('beta', 1.5) or 1.5,
                 'Gross Margins': info.get('grossMargins', 0) or 0,
-                'PE': info.get('trailingPE', np.nan) # Nodig voor Value Score
+                'PE': info.get('trailingPE', np.nan)
             }
         except:
             return None
@@ -77,12 +77,11 @@ def calculate_rrg_vectorized(stock_prices, benchmark_prices, window=14):
     df_rrg['Sweet_Spot_Multiplier'] = np.where((df_rrg['Heading'] >= 0) & (df_rrg['Heading'] <= 90),
                                                np.cos(np.radians(df_rrg['Heading'] - 45)), 0.1)
     
-    # Bepaal Kwadrant
     conditions = [
-        (df_rrg['RS-Ratio'] > 100) & (df_rrg['RS-Momentum'] > 100),
-        (df_rrg['RS-Ratio'] < 100) & (df_rrg['RS-Momentum'] > 100),
+        (df_rrg['RS-Ratio'] >= 100) & (df_rrg['RS-Momentum'] >= 100),
+        (df_rrg['RS-Ratio'] < 100) & (df_rrg['RS-Momentum'] >= 100),
         (df_rrg['RS-Ratio'] < 100) & (df_rrg['RS-Momentum'] < 100),
-        (df_rrg['RS-Ratio'] > 100) & (df_rrg['RS-Momentum'] < 100)
+        (df_rrg['RS-Ratio'] >= 100) & (df_rrg['RS-Momentum'] < 100)
     ]
     choices = ['Leading', 'Improving', 'Lagging', 'Weakening']
     df_rrg['Quadrant'] = np.select(conditions, choices, default='Unknown')
@@ -93,7 +92,6 @@ def calculate_rrg_vectorized(stock_prices, benchmark_prices, window=14):
 
 st.title("🔬 S&P 600 QARP Screener (Quality At a Reasonable Price)")
 
-# Initialiseer session_state voor resultaten
 if 'df_top' not in st.session_state:
     st.session_state.df_top = pd.DataFrame()
 
@@ -101,22 +99,14 @@ tab1, tab2, tab3 = st.tabs(["📚 Waarom deze Screener?", "⚙️ Screener & Res
 
 with tab1:
     st.header("Financiële Geletterdheid: Waarom deze criteria?")
-    st.write("""
-    Het **'Small Cap effect'** stelt dat kleine bedrijven historisch gezien sneller groeien dan grote reuzen. Echter, dit effect wordt vaak tenietgedaan door zogenaamde 'junk' bedrijven (bedrijven met hoge schulden en structurele verliezen). 
-    
-    Om het échte potentieel van kleine aandelen te vangen, filtert deze screener op drie pijlers:
-    """)
-    
+    st.write("Het **'Small Cap effect'** wordt vaak tenietgedaan door 'junk' bedrijven. We filteren op:")
     colA, colB, colC = st.columns(3)
     with colA:
-        st.info("**1. Quality (Kwaliteit - 40%)**\n\n**ROE (Rendement op Eigen Vermogen):** Hoe efficiënt maakt het bedrijf winst met jouw geld?\n\n**Beta (Stabiliteit):** Een score onder de 1 betekent dat het aandeel minder wild beweegt dan de brede markt. We zoeken naar rustige stijgers.")
+        st.info("**1. Quality (Kwaliteit - 40%)**\n\n**ROE:** Hoe efficiënt maakt het bedrijf winst?\n\n**Beta:** We zoeken naar rustige stijgers (<1).")
     with colB:
-        st.warning("**2. Value (Waarde - 30%)**\n\n**P/E Ratio (Koers-winstverhouding):** We willen kwaliteit, maar we willen er niet te veel voor betalen. Bedrijven met een gezonde, relatief lage P/E ratio scoren hier hoger.")
+        st.warning("**2. Value (Waarde - 30%)**\n\n**P/E Ratio:** We willen kwaliteit tegen een eerlijke prijs.")
     with colC:
-        st.success("**3. Momentum (Trend - 30%)**\n\n**RRG (Relative Rotation Graph):** Presteert het aandeel momenteel beter dan de markt? We zoeken aandelen die momentum opbouwen en in het 'Leading' of 'Improving' kwadrant zitten.")
-
-    st.markdown("### De Formule")
-    st.latex(r"Alpha \ Score = (0.4 \times Quality) + (0.3 \times Value) + (0.3 \times Momentum)")
+        st.success("**3. Momentum (Trend - 30%)**\n\n**RRG:** Aandelen die momentum opbouwen en de markt verslaan.")
 
 with tab2:
     if st.button("Start Volledige S&P 600 Scan", type="primary"):
@@ -130,23 +120,19 @@ with tab2:
             with st.spinner('Scores normaliseren en Alpha berekenen...'):
                 df_rrg = calculate_rrg_vectorized(stock_prices, benchmark_prices)
                 
-                # Raw Scores
                 df_fundamentals['Quality_Raw'] = (df_fundamentals['ROE'] * 100) + (df_fundamentals['Gross Margins'] * 100) + np.maximum(0, (2.0 - df_fundamentals['Beta']) * 50)
-                # Value Raw: Hoge voorkeur voor P/E tussen 0 en 30. (Inversie)
                 df_fundamentals['PE_Clean'] = pd.to_numeric(df_fundamentals['PE'], errors='coerce').fillna(999)
                 df_fundamentals['Value_Raw'] = np.where((df_fundamentals['PE_Clean'] > 0) & (df_fundamentals['PE_Clean'] < 100), 1 / df_fundamentals['PE_Clean'], 0)
                 df_rrg['Momentum_Raw'] = df_rrg['Distance'] * df_rrg['Sweet_Spot_Multiplier']
                 
                 df_final = pd.merge(df_rrg, df_fundamentals, on='Ticker', how='inner')
                 
-                # Cross-Sectional Min-Max Scaling (0-100)
                 for col in ['Quality_Raw', 'Value_Raw', 'Momentum_Raw']:
                     min_val, max_val = df_final[col].min(), df_final[col].max()
                     df_final[col.replace('_Raw', '_Score')] = (df_final[col] - min_val) / (max_val - min_val + 1e-9) * 100
                 
                 df_final['Alpha Score'] = (0.4 * df_final['Quality_Score']) + (0.3 * df_final['Value_Score']) + (0.3 * df_final['Momentum_Score'])
                 
-                # Opslaan in session state voor de AI tab
                 st.session_state.df_top = df_final.sort_values(by='Alpha Score', ascending=False).head(50)
             st.success("Screener voltooid!")
 
@@ -154,38 +140,51 @@ with tab2:
         df_display = st.session_state.df_top.copy()
         df_display[['Alpha Score', 'Quality_Score', 'Value_Score', 'Momentum_Score', 'ROE', 'PE_Clean']] = df_display[['Alpha Score', 'Quality_Score', 'Value_Score', 'Momentum_Score', 'ROE', 'PE_Clean']].round(2)
         
+        st.markdown("""
+        ### 🎯 Koopgids: Hoe selecteer je de winnaars?
+        Kijk naar de grafiek hieronder en zoek naar de **"Sweet Spot"**:
+        * 📍 **Positie (Rechtsboven):** Dit is het *Leading* kwadrant. Deze aandelen verslaan de benchmark.
+        * 🟢 **Kleur (Donkergroen):** De kleur toont de **Alpha Score**. Hoe groener, hoe beter de mix van Kwaliteit, Waarde en Momentum. Rood betekent vermijden.
+        * 🔵 **Grootte (Grote bollen):** Hoe groter de bol, hoe sterker de fundamenten (**Quality Score**). 
+        
+        👉 **Jouw ideale aandeel is een GROTE, DONKERGROENE bol in de RECHTERBOVENHOEK.**
+        ---
+        """)
+
         col1, col2 = st.columns([2, 1])
         with col1:
-            st.subheader("Interactive RRG Scatter Plot")
             fig = px.scatter(
-                df_display, x="RS-Ratio", y="RS-Momentum", text="Ticker", size="Alpha Score", color="Quadrant",
-                color_discrete_map={'Leading':'green', 'Improving':'blue', 'Lagging':'red', 'Weakening':'orange'},
-                title="RRG t.o.v. IWM Benchmark", hover_data=['ROE', 'Beta', 'PE_Clean']
+                df_display, x="RS-Ratio", y="RS-Momentum", text="Ticker", 
+                size="Quality_Score",          # Grootte = Kwaliteit/Fundamenten
+                color="Alpha Score",           # Kleur = Totale Alpha Score
+                color_continuous_scale="RdYlGn", # Rood (Slecht) naar Groen (Goed)
+                title="Interactieve RRG: Vind de Donkergroene Bollen", 
+                hover_data=['ROE', 'Beta', 'PE_Clean', 'Quadrant']
             )
             fig.add_hline(y=100, line_dash="dash", line_color="gray")
             fig.add_vline(x=100, line_dash="dash", line_color="gray")
+            
+            # Voeg labels toe voor de kwadranten om het nóg duidelijker te maken
+            fig.add_annotation(x=102, y=102, text="LEADING (Kopen)", showarrow=False, font=dict(color="green", size=14))
+            fig.add_annotation(x=98, y=102, text="IMPROVING (Watchlist)", showarrow=False, font=dict(color="blue", size=10))
+            fig.add_annotation(x=98, y=98, text="LAGGING (Verkopen)", showarrow=False, font=dict(color="red", size=10))
+            fig.add_annotation(x=102, y=98, text="WEAKENING (Let op)", showarrow=False, font=dict(color="orange", size=10))
+            
             st.plotly_chart(fig, use_container_width=True)
             
         with col2:
-            st.subheader("Top 50 QARP Aandelen")
-            st.dataframe(df_display[['Ticker', 'Alpha Score', 'Quadrant', 'ROE', 'Beta']], hide_index=True, use_container_width=True)
+            st.subheader("Top Kooplijst (Gesorteerd op Alpha)")
+            st.dataframe(df_display[['Ticker', 'Alpha Score', 'Quadrant', 'PE_Clean']], hide_index=True, use_container_width=True)
 
 with tab3:
     st.header("🤖 Genereer AI Analyse Prompt")
-    st.write("Gebruik deze tool om direct een op maat gemaakte prompt te genereren voor je favoriete AI (zoals Gemini of ChatGPT) om diepgaand fundamenteel onderzoek te doen.")
-    
+    st.write("Gebruik deze tool om direct een op maat gemaakte prompt te genereren voor je favoriete AI.")
     if not st.session_state.df_top.empty:
-        selected_ticker = st.selectbox("Selecteer een aandeel uit je Top 50:", st.session_state.df_top['Ticker'].tolist())
-        
-        # Haal de specifieke data op voor het gekozen aandeel
+        selected_ticker = st.selectbox("Selecteer een aandeel:", st.session_state.df_top['Ticker'].tolist())
         stock_data = st.session_state.df_top[st.session_state.df_top['Ticker'] == selected_ticker].iloc[0]
-        
         prompt_text = f"""Analyseer aandeel {selected_ticker}. 
-
-Het heeft een ROE van {stock_data['ROE']:.2f}, een Beta van {stock_data['Beta']:.2f}, een P/E ratio van {stock_data['PE_Clean']:.2f} en staat momenteel in het '{stock_data['Quadrant']}' kwadrant van de Relative Rotation Graph. 
-
-Gebruik de principes van Benjamin Graham (Value Investing) en de "Quality minus Junk" theorie van Asness (2018) om de fundamentele gezondheid en het opwaarts potentieel van dit aandeel in kaart te brengen voor een belegger met een lange horizon. Wat zijn de specifieke bedrijfsrisico's en katalysatoren?"""
-
-        st.text_area("Kopieer deze tekst en plak hem in je AI assistent:", value=prompt_text, height=200)
+Het heeft een ROE van {stock_data['ROE']:.2f}, een Beta van {stock_data['Beta']:.2f}, een P/E ratio van {stock_data['PE_Clean']:.2f} en staat momenteel in het '{stock_data['Quadrant']}' kwadrant van de RRG. 
+Gebruik de "Quality minus Junk" theorie van Asness om de fundamentele gezondheid in kaart te brengen."""
+        st.text_area("Plak dit in Gemini/ChatGPT:", value=prompt_text, height=150)
     else:
-        st.info("Draai eerst de screener in de 'Screener & Resultaten' tab om aandelen te kunnen selecteren.")
+        st.info("Draai eerst de screener.")

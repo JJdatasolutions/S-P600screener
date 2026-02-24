@@ -133,7 +133,7 @@ with tab2:
                     df_final[col.replace('_Raw', '_Score')] = (df_final[col] - min_val) / (max_val - min_val + 1e-9) * 100
                 
                 df_final['Alpha Score'] = (0.4 * df_final['Quality_Score']) + (0.3 * df_final['Value_Score']) + (0.3 * df_final['Momentum_Score'])
-                
+                df_final = df_final[df_final['PE_Clean'] != 999]
                 st.session_state.df_top = df_final.sort_values(by='Alpha Score', ascending=False).head(50)
             st.success("Screener voltooid!")
 

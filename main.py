@@ -235,7 +235,7 @@ with tab3:
             with st.spinner("Agent schrijft het rapport..."):
                 try:
                     # 5. Roep het Gemini model aan
-                    model = genai.GenerativeModel('gemini-1.5-flash') # Snel en krachtig model
+                    model = genai.GenerativeModel('gemini-pro') # Snel en krachtig model
                     response = model.generate_content(agent_prompt)
                     
                     # 6. Toon het resultaat prachtig in Streamlit
